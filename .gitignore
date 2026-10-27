@@ -1,0 +1,11 @@
+# build output
+build/
+dist/
+*.spec
+__pycache__/
+
+# runtime files
+focusmute.log
+focusmute.log.*
+focusmute.state.json
+*.exe
