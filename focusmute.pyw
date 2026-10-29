@@ -1,6 +1,9 @@
-"""FocusMute - 目标程序切到后台就静音（可选暂停），切回来恢复。
+"""FocusMute - 目标程序切到后台就静音并暂停（各自可关），切回来恢复。
 
 托盘图标看状态，右键有菜单。配置在同目录 focusmute.ini，可填多个程序名。
+改完 ini 保存后会自动重载（约半秒），托盘菜单里也有「重载配置」，不用重启。
+挂起的窗口点任务栏激活不了（Windows 不会激活无响应窗口），所以托盘菜单里每个游戏
+那一行本身就是恢复入口：点哪一行就把哪个游戏恢复、解除静音并切回前台。
 日志 focusmute.log，崩溃/强杀后下次启动会自动恢复被暂停的进程（focusmute.state.json）。
 
 用法：
@@ -29,7 +32,6 @@ STATE_PATH = os.path.join(BASE, "focusmute.state.json")
 LOG_MAX = 512 * 1024
 
 PROCESS_SUSPEND_RESUME = 0x0800
-MUTE_DELAY_S = 2.0      # the target must stay in the background this long before muting
 REASSERT_S = 2.0        # re-push the wanted mute state this often (see apply())
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -62,14 +64,53 @@ def log(msg):
 
 
 # ------------------------------------------------------------------------ config
+def ini_text(path):
+    """Read the ini with one tolerance: an indented [target:xxx] header is still a
+    header. configparser treats an indented line as a continuation of the previous
+    value, so a single leading space swallowed the whole "pause = true" into
+    poll_ms and the override silently never applied."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            raw = handle.read()
+    except OSError:
+        return None                      # unreadable: the caller must keep the old config
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            line = stripped
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def conf_signature():
+    """(mtime, size) so the poller can notice the ini was saved"""
+    try:
+        st = os.stat(CONF_PATH)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _int_option(section, key, default, minimum):
+    """int config value with a floor; a bad value falls back instead of crashing"""
+    try:
+        return max(minimum, int(str(section.get(key, default)).strip()))
+    except (TypeError, ValueError):
+        log("配置项 %s 不是整数，用默认值 %s" % (key, default))
+        return default
+
+
 class Config(object):
     def __init__(self, path=CONF_PATH):
         self.processes = []
         self.poll_ms = 250
         self.do_mute = True
         self.do_pause = False
-        parser = configparser.ConfigParser()
-        parser.read(path, encoding="utf-8")
+        parser = configparser.ConfigParser(strict=False)
+        text = ini_text(path)
+        self.ok = text is not None
+        parser.read_string(text or "", source=str(path))
         section = parser["general"] if parser.has_section("general") else {}
         raw = section.get("process", "")
         self.processes = [p.strip().lower() for p in raw.replace(";", ",").split(",") if p.strip()]
@@ -79,12 +120,20 @@ class Config(object):
             self.poll_ms = 250
         self.do_mute = section.get("mute", "true").strip().lower() in ("1", "true", "yes", "on")
         self.do_pause = section.get("pause", "false").strip().lower() in ("1", "true", "yes", "on")
+        # mute and pause have separate delays: cutting the sound after a beat avoids
+        # a click-clack when briefly alt-tabbing, but a game that keeps running while
+        # it is in the background can kill the player in that beat, so pausing defaults
+        # to "as soon as the poller notices" (0 ms)
+        self.delay_ms = _int_option(section, "delay_ms", 2000, 0)
+        self.pause_delay_ms = _int_option(section, "pause_delay_ms", 0, 0)
 
         # every process starts with the global switches, then [target:<exe>]
         # sections override them one by one
         self.targets = {}
         for name in self.processes:
-            self.targets[name] = {"mute": self.do_mute, "pause": self.do_pause}
+            self.targets[name] = {"mute": self.do_mute, "pause": self.do_pause,
+                                  "delay_ms": self.delay_ms,
+                                  "pause_delay_ms": self.pause_delay_ms}
         for sec in parser.sections():
             if not sec.lower().startswith("target:"):
                 continue
@@ -97,14 +146,28 @@ class Config(object):
                 raw_value = body.get(key)
                 if raw_value is not None:
                     self.targets[name][key] = raw_value.strip().lower() in ("1", "true", "yes", "on")
+            for key in ("delay_ms", "pause_delay_ms"):
+                if body.get(key) is not None:
+                    self.targets[name][key] = _int_option(body, key, self.targets[name][key], 0)
 
     def flags(self, name):
-        return self.targets.get(name, {"mute": self.do_mute, "pause": self.do_pause})
+        return self.targets.get(name, {"mute": self.do_mute, "pause": self.do_pause,
+                                       "delay_ms": self.delay_ms,
+                                       "pause_delay_ms": self.pause_delay_ms})
 
 
 # ---------------------------------------------------------------------- win32 bits
 user32.GetWindowTextW.argtypes = [wt.HWND, ctypes.c_void_p, ctypes.c_int]
 user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.IsWindowVisible.argtypes = [wt.HWND]
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+user32.IsIconic.argtypes = [wt.HWND]
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.SwitchToThisWindow.argtypes = [wt.HWND, wt.BOOL]
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 
 def foreground_info():
@@ -123,6 +186,51 @@ def foreground_info():
 
 def foreground_pid():
     return foreground_info()[0]
+
+
+def find_main_window(pids):
+    """biggest visible top-level window owned by any of these pids"""
+    found = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def enum_proc(hwnd, lparam):
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in pids and user32.IsWindowVisible(hwnd):
+            rect = wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            width, height = rect.right - rect.left, rect.bottom - rect.top
+            if width >= 320 and height >= 200:
+                found.append((width * height, hwnd))
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    return max(found)[1] if found else None
+
+
+def activate_window(pids):
+    """bring that window back to the front. A suspended game never receives the
+    click, so the tray action has to hand it the foreground itself."""
+    hwnd = find_main_window(pids)
+    if not hwnd:
+        return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)                  # SW_RESTORE
+    fg = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    this_thread = kernel32.GetCurrentThreadId()
+    attached = bool(fg_thread and fg_thread != this_thread and
+                    user32.AttachThreadInput(fg_thread, this_thread, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        ok = bool(user32.SetForegroundWindow(hwnd))
+        if not ok or user32.GetForegroundWindow() != hwnd:
+            user32.SwitchToThisWindow(hwnd, True)
+            ok = user32.GetForegroundWindow() == hwnd
+    finally:
+        if attached:
+            user32.AttachThreadInput(fg_thread, this_thread, False)
+    return ok
 
 
 def process_alive(pid):
@@ -250,14 +358,30 @@ def family_map(names):
     return found, families
 
 
+_fail_log_at = {}
+
+
+def log_failure(what, pid, detail):
+    """a suspend/resume that keeps failing would otherwise write a line every tick"""
+    key = (what, pid)
+    now = time.time()
+    if now - _fail_log_at.get(key, 0.0) >= 60:
+        _fail_log_at[key] = now
+        log("%s失败 pid=%d：%s" % (what, pid, detail))
+
+
 def suspend(pid):
     if pid in (0, 4, os.getpid()):
         return False
     handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
     if not handle:
+        log_failure("暂停", pid, "OpenProcess 被拒 err=%d（权限不够？）" % ctypes.get_last_error())
         return False
     try:
-        return ntdll.NtSuspendProcess(handle) == 0
+        rc = ntdll.NtSuspendProcess(handle)
+        if rc != 0:
+            log_failure("暂停", pid, "NtSuspendProcess=0x%08X" % (rc & 0xFFFFFFFF))
+        return rc == 0
     finally:
         kernel32.CloseHandle(handle)
 
@@ -265,9 +389,13 @@ def suspend(pid):
 def resume(pid):
     handle = kernel32.OpenProcess(PROCESS_SUSPEND_RESUME, False, pid)
     if not handle:
+        log_failure("恢复", pid, "OpenProcess 被拒 err=%d" % ctypes.get_last_error())
         return False
     try:
-        return ntdll.NtResumeProcess(handle) == 0
+        rc = ntdll.NtResumeProcess(handle)
+        if rc != 0:
+            log_failure("恢复", pid, "NtResumeProcess=0x%08X" % (rc & 0xFFFFFFFF))
+        return rc == 0
     finally:
         kernel32.CloseHandle(handle)
 
@@ -328,6 +456,10 @@ class Tracker(object):
         self.applied = {}          # pid -> dict(muted=bool, suspended=bool)
         self.last_status = ""
         self.per_target = {}
+        self.on_reload = None       # tray sets this so a reload rebuilds its menu
+        # pids the user resumed by hand: a suspended window cannot be clicked back,
+        # so auto pause stays disarmed for them until they are in front again
+        self.manual_hold = set()
         # the poller runs on its own thread; without this, a tick that already read
         # enabled=True can mute right after the tray switched the feature off
         self._lock = threading.RLock()
@@ -348,9 +480,15 @@ class Tracker(object):
             pass
 
     def clear_stale_mute(self):
-        """a hard kill may have left the target muted; the rule never wants to start muted"""
+        """a hard kill may have left the target muted. Clear it only while the target is
+        in front (or Windows cannot tell): unmuting a background target here would let
+        its sound play for delay_ms until the poller mutes it again."""
+        fg = foreground_pid()
+        families = family_map(self.cfg.processes)[1] if self.cfg.processes else {}
         for name, pids in find_pids(self.cfg.processes).items():
             for pid in pids:
+                if fg and fg not in families.get(pid, {pid}):
+                    continue
                 if set_mute(pid, False):
                     log("启动时清除残留静音 pid=%d" % pid)
                     self.applied.setdefault(pid, {"muted": False, "suspended": False})["muted"] = False
@@ -372,9 +510,117 @@ class Tracker(object):
             if value == self.enabled:
                 return
             self.enabled = value
-            log("自动静音 %s" % ("开启" if value else "关闭"))
+            log("自动静音+暂停 %s" % ("开启" if value else "关闭"))
             if not value:
                 self.release_all()
+
+    def restore_target(self, name):
+        """per-game escape hatch: resume this one, give its sound back and bring it to
+        the front. Clicking a suspended window does not activate it, so the tray menu
+        has to do it. Auto pause stays disarmed for it until it has been in front."""
+        pids = find_pids([name]).get(name, [])
+        if not pids:
+            log("恢复 %s：没有在运行" % name)
+            return False
+        with self._lock:
+            for pid in pids:
+                st = self.applied.get(pid)
+                if st and st.get("suspended"):
+                    if resume(pid):
+                        st["suspended"] = False
+                        st["pause_failed"] = False
+                        log("手动恢复暂停：%s pid=%d" % (name, pid))
+                    else:
+                        log("手动恢复失败：%s pid=%d" % (name, pid))
+                if st and st.get("muted"):
+                    if set_mute(pid, False):
+                        st["muted"] = False
+                        log("手动解除静音：%s pid=%d" % (name, pid))
+                self.manual_hold.add(pid)
+            self._write_state_file()
+        if activate_window(set(pids)):
+            log("已恢复并切回 %s" % name)
+        else:
+            log("%s 已恢复，但没能自动切到前台（点一下游戏即可）" % name)
+        return True
+
+    def reload_config(self):
+        """re-read focusmute.ini; the tray item and the auto reload both come here"""
+        try:
+            new_cfg = Config()
+        except Exception as exc:                      # noqa: BLE001
+            log("重载配置失败，继续用旧配置：%s" % exc)
+            return False
+        return self.reconfigure(new_cfg)
+
+    def reconfigure(self, new_cfg):
+        """swap in a freshly parsed config without restarting: a target that was
+        removed or switched off is resumed/unmuted immediately"""
+        if not getattr(new_cfg, "ok", True):
+            log("重载配置：ini 打不开，继续用旧配置")
+            return False
+        with self._lock:
+            exe_of = exe_name_by_pid()
+            for pid in list(self.applied):
+                st = self.applied[pid]
+                name = exe_of.get(pid, "")
+                if name not in new_cfg.processes:
+                    self._release_pid(pid, "已从配置移除")
+                    continue
+                flags = new_cfg.flags(name)
+                if st.get("suspended") and not flags["pause"]:
+                    if resume(pid):
+                        st["suspended"] = False
+                        log("重载配置：恢复 pid=%d（pause 已关）" % pid)
+                if st.get("muted") and not flags["mute"]:
+                    if set_mute(pid, False):
+                        st["muted"] = False
+                        log("重载配置：解除静音 pid=%d（mute 已关）" % pid)
+                st.pop("pause_retry_at", None)
+            self.cfg = new_cfg
+            self.last_status = ""
+            self._logged_status = None
+            self.per_target = {}
+            self._write_state_file()
+            if not new_cfg.processes:
+                log("重载配置：process= 是空的，什么都不做")
+            else:
+                log("重载配置：processes=%s poll_ms=%d" % (new_cfg.processes, new_cfg.poll_ms))
+                for name in new_cfg.processes:
+                    flags = new_cfg.flags(name)
+                    log("  目标 %s：mute=%s(%dms) pause=%s(%dms)"
+                        % (name, flags["mute"], flags["delay_ms"],
+                           flags["pause"], flags["pause_delay_ms"]))
+        callback = self.on_reload
+        if callback is not None:
+            try:
+                callback()
+            except Exception as exc:                  # noqa: BLE001
+                log("重载后刷新托盘失败：%s" % exc)
+        return True
+
+    def _release_pid(self, pid, reason):
+        st = self.applied.get(pid)
+        if st is None:
+            return
+        released = True
+        if st.get("suspended"):
+            if resume(pid):
+                st["suspended"] = False
+                log("解除暂停 pid=%d（%s）" % (pid, reason))
+            else:
+                released = False                  # keep tracking it so quit/next start can retry
+        if st.get("muted"):
+            if set_mute(pid, False):
+                st["muted"] = False
+                log("解除静音 pid=%d（%s）" % (pid, reason))
+            else:
+                released = False
+        if released:
+            self.applied.pop(pid, None)
+            self.bg_since.pop(pid, None)
+            self.last_assert.pop(pid, None)
+            self.manual_hold.discard(pid)
 
     def apply(self, pid, flags, muted, suspended):
         st = self.applied.setdefault(pid, {"muted": False, "suspended": False})
@@ -383,13 +629,24 @@ class Tracker(object):
         want_suspend = bool(suspended and flags["pause"])
         want_mute = bool(muted and flags["mute"])
         if want_suspend and not st["suspended"]:
-            if suspend(pid):
-                st["suspended"] = True
-                log("暂停 pid=%d" % pid)
+            now = time.time()
+            if now >= st.get("pause_retry_at", 0.0):
+                if suspend(pid):
+                    st["suspended"] = True
+                    st["pause_failed"] = False
+                    log("暂停 pid=%d" % pid)
+                else:
+                    # retry every couple of seconds instead of every tick; the reason
+                    # itself is written by suspend() once a minute
+                    st["pause_failed"] = True
+                    st["pause_retry_at"] = now + 2.0
         elif not want_suspend and st["suspended"]:
             if resume(pid):
                 st["suspended"] = False
+                st["pause_failed"] = False
                 log("恢复 pid=%d" % pid)
+        elif not want_suspend:
+            st["pause_failed"] = False
         if want_mute and not st["muted"]:
             now = time.time()
             if st.get("mute_failed") and now < st.get("mute_retry_at", 0):
@@ -437,6 +694,7 @@ class Tracker(object):
                     st["muted"] = False
                     log("退出前解除静音 pid=%d" % pid)
         self._write_state_file()
+        self.manual_hold.clear()              # re-enabling starts from a clean slate
 
     def step(self):
         with self._lock:
@@ -465,15 +723,22 @@ class Tracker(object):
                 now = time.time()
                 if background:
                     started = self.bg_since.setdefault(pid, now)
-                    settled = (now - started) >= MUTE_DELAY_S
+                    elapsed = now - started
+                    settled_mute = elapsed >= flags["delay_ms"] / 1000.0
+                    settled_pause = elapsed >= flags["pause_delay_ms"] / 1000.0
                 else:
                     self.bg_since.pop(pid, None)
-                    settled = False
-                self.apply(pid, flags, self.enabled and background and settled,
-                           self.enabled and background and settled)
+                    settled_mute = settled_pause = False
+                    self.manual_hold.discard(pid)     # back in front: arm auto pause again
+                held = background and pid in self.manual_hold
+                self.apply(pid, flags, self.enabled and background and settled_mute,
+                           self.enabled and background and settled_pause and not held)
         for pid in list(self.applied.keys()):
             if not process_alive(pid):
                 self.applied.pop(pid, None)
+                self.bg_since.pop(pid, None)
+                self.last_assert.pop(pid, None)
+                self.manual_hold.discard(pid)     # a reused pid must not inherit a hold
         # report every configured target, not just the running ones, so it is obvious
         # which of several candidate exe names is the live one
         per = {}
@@ -506,6 +771,10 @@ class Tracker(object):
         bits = []
         if state.get("suspended"):
             bits.append("暂停")
+        elif state.get("pause_failed"):
+            bits.append("暂停失败")
+        if pid in self.manual_hold and not state.get("suspended"):
+            bits.append("已放行")
         if state.get("muted"):
             bits.append("静音")
         if not bits:
@@ -581,26 +850,55 @@ def run_tray(tracker, stop_event):
         stop_event.set()
         icon.stop()
 
-    def toggle_text(item):
-        # this single row is the whole on/off story: switching it off also hands the
-        # sound back immediately, so a separate "restore" row would do the same thing
+    def notify(icon, message):
+        try:
+            icon.notify(message, "FocusMute")
+        except Exception:                            # noqa: BLE001 - balloon is optional
+            pass
+
+    def reload_conf(icon, item):
+        # the rebuild itself happens in tracker.on_reload, so the auto reload gets it too
+        if tracker.reload_config():
+            notify(icon, "配置已重载")
+        else:
+            notify(icon, "重载失败，详见日志")
+
+    def toggle_text(item):        # this single row is the whole on/off story: switching it off also hands the
+        # sound and the suspended process back immediately, so a separate "restore"
+        # row would do the same thing
         if tracker.enabled:
-            return "自动静音：已开启（点击关闭并恢复声音）"
-        return "自动静音：已关闭（点击开启）"
+            return "自动静音+暂停：已开启（点击关闭并恢复）"
+        return "自动静音+暂停：已关闭（点击开启）"
+
+    def build_menu():
+        # the per-game status rows double as the way back: a suspended window cannot
+        # be activated by clicking it, so clicking the row resumes and brings it front
+        items = [pystray.MenuItem("状态（点游戏名：恢复并切回）", None, enabled=False)]
+        items += [pystray.MenuItem(
+                      lambda item, n=name: "   " + n.split(".")[0] + "：" + tracker.per_target.get(n, "…"),
+                      safe("restore", lambda icon, item, n=name: tracker.restore_target(n)),
+                      enabled=lambda item, n=name: tracker.per_target.get(n, "未运行") != "未运行")
+                  for name in tracker.cfg.processes]
+        items += [
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(toggle_text, safe("toggle", toggle), default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("重载配置（改完 ini 立即生效）", safe("reload", reload_conf)),
+            pystray.MenuItem("打开日志", safe("log", open_log)),
+            pystray.MenuItem("编辑配置", safe("conf", open_conf)),
+            pystray.MenuItem("退出（会自动恢复声音和暂停）", safe("quit", quit_)),
+        ]
+        return pystray.Menu(*items)
 
     icon = pystray.Icon("FocusMute", make_icon_image(tracker.enabled), "FocusMute",
-                        menu=pystray.Menu(
-                            pystray.MenuItem("状态", None, enabled=False),
-                            *[pystray.MenuItem(lambda item, n=name: "   " + n.split(".")[0] + "：" + tracker.per_target.get(n, "…"),
-                                              None, enabled=False)
-                              for name in tracker.cfg.processes],
-                            pystray.Menu.SEPARATOR,
-                            pystray.MenuItem(toggle_text, safe("toggle", toggle), default=True),
-                            pystray.Menu.SEPARATOR,
-                            pystray.MenuItem("打开日志", safe("log", open_log)),
-                            pystray.MenuItem("编辑配置", safe("conf", open_conf)),
-                            pystray.MenuItem("退出（会自动恢复声音和暂停）", safe("quit", quit_)),
-                        ))
+                        menu=build_menu())
+
+    def refresh_menu():
+        # targets may have been added or removed by the reload
+        icon.menu = build_menu()
+        icon.update_menu()
+
+    tracker.on_reload = refresh_menu
 
     def updater():
         ticks = 0
@@ -623,13 +921,14 @@ def run_tray(tracker, stop_event):
 def selftest():
     problems = 0
     cfg = Config()
-    print("config: processes=%s poll_ms=%d global mute=%s pause=%s"
-          % (cfg.processes, cfg.poll_ms, cfg.do_mute, cfg.do_pause))
+    print("config: processes=%s poll_ms=%d global mute=%s pause=%s delay_ms=%d pause_delay_ms=%d"
+          % (cfg.processes, cfg.poll_ms, cfg.do_mute, cfg.do_pause, cfg.delay_ms, cfg.pause_delay_ms))
     for name in cfg.processes:
         flags = cfg.flags(name)
-        print("  target %s -> mute=%s pause=%s" % (name, flags["mute"], flags["pause"]))
+        print("  target %s -> mute=%s pause=%s delay_ms=%d pause_delay_ms=%d"
+              % (name, flags["mute"], flags["pause"], flags["delay_ms"], flags["pause_delay_ms"]))
     if not cfg.processes:
-        print("FAIL: focusmute.ini 里没有 process=")
+        print("FAIL: focusmute.ini 里没有 process=" if cfg.ok else "FAIL: focusmute.ini 读不到")
         problems += 1
     for symbol in ("GetForegroundWindow", "GetWindowThreadProcessId", "OpenProcess", "CloseHandle"):
         if not hasattr(user32, symbol) and not hasattr(kernel32, symbol):
@@ -697,13 +996,14 @@ def main():
         return 0
 
     cfg = Config()
-    log("FocusMute 启动：processes=%s poll_ms=%d mute=%s pause=%s"
-        % (cfg.processes, cfg.poll_ms, cfg.do_mute, cfg.do_pause))
+    log("FocusMute 启动：processes=%s poll_ms=%d mute=%s pause=%s delay_ms=%d pause_delay_ms=%d"
+        % (cfg.processes, cfg.poll_ms, cfg.do_mute, cfg.do_pause, cfg.delay_ms, cfg.pause_delay_ms))
     for name in cfg.processes:
         flags = cfg.flags(name)
-        log("  目标 %s：mute=%s pause=%s" % (name, flags["mute"], flags["pause"]))
+        log("  目标 %s：mute=%s(%dms) pause=%s(%dms)"
+            % (name, flags["mute"], flags["delay_ms"], flags["pause"], flags["pause_delay_ms"]))
     if not cfg.processes:
-        log("focusmute.ini 里没有 process=，什么都没得做。")
+        log("focusmute.ini 里没有 process=，什么都没得做。" if cfg.ok else "focusmute.ini 读不到。")
         return 2
 
     tracker = Tracker(cfg)
@@ -711,14 +1011,26 @@ def main():
     tracker.clear_stale_mute()
 
     stop_event = threading.Event()
+    conf_sig = conf_signature()
+    pending_sig = None
 
     def poll_loop():
+        nonlocal conf_sig, pending_sig
         while not stop_event.is_set():
             try:
+                sig = conf_signature()
+                if sig is not None and sig != conf_sig:
+                    # an editor may write the file in several steps: only reload once
+                    # the same signature has been seen twice (two ticks apart)
+                    if sig == pending_sig:
+                        conf_sig, pending_sig = sig, None
+                        tracker.reload_config()
+                    else:
+                        pending_sig = sig
                 tracker.step()
             except Exception as exc:                   # noqa: BLE001
                 log("轮询出错：%s" % exc)
-            stop_event.wait(cfg.poll_ms / 1000.0)
+            stop_event.wait(tracker.cfg.poll_ms / 1000.0)
 
     threading.Thread(target=poll_loop, daemon=True).start()
 
