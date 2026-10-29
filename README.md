@@ -36,7 +36,7 @@ It touches exactly one app's audio session — everything else keeps working nor
 
 - Windows 10 / 11
 - From source: Python 3.10+, then `pip install -r requirements.txt`
-- Or build/download `FocusMute.exe` — no Python needed.
+- Or [download the latest `FocusMute.exe`](https://github.com/jmwangde3/FocusMute/releases/latest) — no Python needed.
 
 ### Install (from source)
 
@@ -130,7 +130,7 @@ MIT — see [LICENSE](LICENSE).
 
 - Windows 10 / 11
 - 源码运行：Python 3.10+，先 `pip install -r requirements.txt`
-- 或者直接构建/下载 `FocusMute.exe`，不需要装 Python。
+- 或者[直接下载最新的 `FocusMute.exe`](https://github.com/jmwangde3/FocusMute/releases/latest)，不需要装 Python。
 
 ### 安装（源码）
 
