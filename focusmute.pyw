@@ -460,6 +460,11 @@ class Tracker(object):
         # pids the user resumed by hand: a suspended window cannot be clicked back,
         # so auto pause stays disarmed for them until they are in front again
         self.manual_hold = set()
+        # pids that have held the foreground at least once. A game that is still
+        # starting (launcher has not shown its window yet) must not be suspended
+        # before that: freezing it during initialisation can hang the whole game.
+        self.armed = set()
+        self._unarmed_logged = set()
         # the poller runs on its own thread; without this, a tick that already read
         # enabled=True can mute right after the tray switched the feature off
         self._lock = threading.RLock()
@@ -621,6 +626,8 @@ class Tracker(object):
             self.bg_since.pop(pid, None)
             self.last_assert.pop(pid, None)
             self.manual_hold.discard(pid)
+            self.armed.discard(pid)
+            self._unarmed_logged.discard(pid)
 
     def apply(self, pid, flags, muted, suspended):
         st = self.applied.setdefault(pid, {"muted": False, "suspended": False})
@@ -726,19 +733,30 @@ class Tracker(object):
                     elapsed = now - started
                     settled_mute = elapsed >= flags["delay_ms"] / 1000.0
                     settled_pause = elapsed >= flags["pause_delay_ms"] / 1000.0
+                    if pid not in self.armed and pid not in self._unarmed_logged:
+                        self._unarmed_logged.add(pid)
+                        log("%s pid=%d 还没在前台露过面，先不静音也不挂起（等它显示出来）" % (name, pid))
                 else:
                     self.bg_since.pop(pid, None)
                     settled_mute = settled_pause = False
                     self.manual_hold.discard(pid)     # back in front: arm auto pause again
+                    self.armed.add(pid)
+                    self._unarmed_logged.discard(pid)
                 held = background and pid in self.manual_hold
-                self.apply(pid, flags, self.enabled and background and settled_mute,
-                           self.enabled and background and settled_pause and not held)
-        for pid in list(self.applied.keys()):
+                if pid in self.armed:
+                    # an unarmed pid is not touched at all: no mute, no unmute, no
+                    # suspend. It is armed the first moment it holds the foreground.
+                    self.apply(pid, flags,
+                               self.enabled and background and settled_mute,
+                               self.enabled and background and settled_pause and not held)
+        for pid in set(self.applied) | self.armed:
             if not process_alive(pid):
                 self.applied.pop(pid, None)
                 self.bg_since.pop(pid, None)
                 self.last_assert.pop(pid, None)
                 self.manual_hold.discard(pid)     # a reused pid must not inherit a hold
+                self.armed.discard(pid)
+                self._unarmed_logged.discard(pid)
         # report every configured target, not just the running ones, so it is obvious
         # which of several candidate exe names is the live one
         per = {}
@@ -768,6 +786,8 @@ class Tracker(object):
             return "前台"
         if family and fg in family and not state.get("muted"):
             return "随前台"
+        if pid not in self.armed:
+            return "待前台"          # never shown up yet: left alone until it does
         bits = []
         if state.get("suspended"):
             bits.append("暂停")

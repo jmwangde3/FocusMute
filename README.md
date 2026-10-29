@@ -19,6 +19,10 @@ It touches exactly one app's audio session — everything else keeps working nor
 - **Two separate delays**: `delay_ms` (mute, default **2000 ms**) and `pause_delay_ms` (suspend,
   default **0 ms**). A game that keeps running in the background can kill the player in those two
   seconds, so pausing is immediate by default; both values are configurable.
+- **A target is left completely alone until it has been in the foreground at least once.** A game
+  that is still starting (its window has not shown up yet) is neither muted nor suspended, so
+  launching cannot hang it. Once you have been in the game, switching away mutes and suspends it
+  immediately.
 - If Windows refuses to report a foreground window (some exclusive-fullscreen games), it **holds
   the previous state** instead of guessing.
 - The wanted mute state is **pushed back to the session every 2 seconds**; Windows remembers
@@ -82,8 +86,9 @@ Edits apply on save — no restart needed.
 ### Tray menu
 
 - Header `状态（点游戏名：恢复并切回）` — status rows follow.
-- One row per configured target: `front` / `follows the front` / `paused` / `pause failed` /
-  `resumed (held)` / `muted` / `no audio session` / `not running`. Refreshed every 2 seconds.
+- One row per configured target: `front` / `follows the front` / `waiting for its first
+  foreground` / `paused` / `pause failed` / `resumed (held)` / `muted` / `no audio session` /
+  `not running`. Refreshed every 2 seconds.
 - **Click a running target's row** = resume it, unmute it, bring its window to the front.
   Rows of apps that are not running are greyed out.
 - `Auto mute+pause: on` — switching it off **hands the sound and the suspended process back
@@ -118,6 +123,8 @@ MIT — see [LICENSE](LICENSE).
 - **静音和暂停的延迟分开**：`delay_ms`（静音，默认 **2000 毫秒**）和 `pause_delay_ms`
   （挂起，默认 **0**）。切出去还在跑的游戏，那两秒足够把人打死，所以暂停默认立即生效；
   两个值都能改。
+- **目标在第一次到过前台之前完全不碰。** 刚启动、窗口还没出来的游戏既不静音也不挂起，启动不会卡死；
+  进过游戏之后，切出去照样立即静音/挂起。
 - 拿不到前台窗口时（某些全屏独占游戏）**保持原状态**，不猜。
 - 每 2 秒把静音状态**硬写回会话**一次：Windows 会按程序记住「被静音过」，新会话可能一出生就是静的。
 - **配置保存即生效**：改完 `focusmute.ini` 约半秒自动重载，托盘菜单里也有「重载配置」。
@@ -175,8 +182,8 @@ pause_delay_ms = 0
 
 ### 托盘
 
-- 第一行 `状态（点游戏名：恢复并切回）`，下面每个目标一行：`前台` / `随前台` / `暂停` /
-  `暂停失败` / `已放行` / `静音` / `无音频会话` / `未运行`，每 2 秒刷新
+- 第一行 `状态（点游戏名：恢复并切回）`，下面每个目标一行：`前台` / `随前台` / `待前台` /
+  `暂停` / `暂停失败` / `已放行` / `静音` / `无音频会话` / `未运行`，每 2 秒刷新
 - **点在运行的目标那一行** = 恢复它、解除静音、把窗口切回前台；没在运行的行是灰的
 - `自动静音+暂停：已开启` 这一行关掉自动行为时**立刻把声音和挂起的进程还给你**；
   左键点图标等同这一行
